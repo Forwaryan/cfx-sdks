@@ -42,11 +42,9 @@ func (worker *Worker) wait_single_transfer(cfx1 types.Address, cfx2 types.Addres
 		fmt.Println(err)
 		//invalidTransactions++
 	}
-	receipt, err := worker.client.WaitForTransationReceipt(txhash, 5)
-	if err != nil {
-		fmt.Println(err)
-		//invalidTransactions++
-	}
+	// 使用 waitLastTx 等待交易确认
+	receipt := worker.waitLastTx(&txhash)
+
 	elapsed := time.Since(begin)
 	_, err = file2.WriteString(fmt.Sprintf("交易情况%v\n", receipt))
 	if err != nil {

@@ -250,15 +250,16 @@ func (worker *Worker) flushPendingTransactions(value *hexutil.Big) {
 	}
 }
 
-func (worker *Worker) waitLastTx() {
-	if worker.lastTxHash == nil {
+func (worker *Worker) waitLastTx(lastTxHash *types.Hash) *types.TransactionReceipt {
+	if lastTxHash == nil {
 		log.Default().Printf("[Worker %s] No last transaction to wait for", worker.address)
-		return
+		return nil
 	}
-	log.Default().Printf("[Worker %s] Waiting for last transaction receipt: %v", worker.address, *worker.lastTxHash)
+	log.Default().Printf("[Worker %s] Waiting for last transaction receipt: %v", worker.address, *lastTxHash)
 
 	startWait := time.Now()
-	ticker := time.NewTicker(500 * time.Millisecond)
+	// 0.1s询问一次rpc
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
 	// Set a timeout for waiting (e.g., 120 seconds)
@@ -267,18 +268,18 @@ func (worker *Worker) waitLastTx() {
 	for {
 		select {
 		case <-timeout:
-			log.Default().Printf("[Worker %s] Timeout waiting for last transaction receipt: %v. Waited: %v", worker.address, *worker.lastTxHash, time.Since(startWait))
-			return
+			log.Default().Printf("[Worker %s] Timeout waiting for last transaction receipt: %v. Waited: %v", worker.address, *lastTxHash, time.Since(startWait))
+			return nil
 		case <-ticker.C:
-			receipt, err := worker.client.GetTransactionReceipt(*worker.lastTxHash)
+			receipt, err := worker.client.GetTransactionReceipt(*lastTxHash)
 			if err != nil {
 				// Ignore transient errors, keep retrying
 				continue
 			}
 			if receipt != nil {
 				// Transaction included
-				log.Default().Printf("[Worker %s] Last transaction confirmed: %v, receipt: %v. Waited: %v", worker.address, *worker.lastTxHash, receipt, time.Since(startWait))
-				return
+				log.Default().Printf("[Worker %s] Last transaction confirmed: %v, receipt: %v. Waited: %v", worker.address, *lastTxHash, receipt, time.Since(startWait))
+				return receipt
 			}
 		}
 	}
@@ -327,7 +328,7 @@ func (worker *Worker) random_transfer(ctx context.Context, startPeer int, limit 
 	for {
 		if limit > 0 && total >= limit {
 			worker.flushPendingTransactions(singleTransfer)
-			worker.waitLastTx()
+			worker.waitLastTx(worker.lastTxHash)
 			*worker.sinal <- int(total)
 			return int(total)
 		}
