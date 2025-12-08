@@ -35,9 +35,9 @@ var (
 )
 
 const (
-	KEYDIR string = "./keystore"
+	// KEYDIR string = "./keystore"
 
-	// KEYDIR string = "./keytest"
+	KEYDIR string = "./keytest"
 
 // 21是燃油费 -> 0.000021CFX
 )
@@ -57,7 +57,8 @@ type allocationRequest struct {
 }
 
 type startRequest struct {
-	Time *float64 `json:"time"`
+	Time  *float64 `json:"time"`
+	TxNum *int     `json:"tx_num"`
 }
 
 type latencyRequest struct {
@@ -172,22 +173,46 @@ func final_single_test(tb *TestBed) {
 	wg.Wait()
 }
 
-func (tb *TestBed) start(timeLimit float64) {
-	if timeLimit <= 0 {
-		timeLimit = 1
+/*
+如果txNum = -1，则表示时间模式，运行timeLimit秒
+如果txNum > 0，则表示数量模式，运行直到完成txNum笔交易
+*/
+
+func (tb *TestBed) start(timeLimit float64, txNum int) {
+	var duration time.Duration
+
+	if txNum > 0 {
+		// Count mode: Set a very long timeout (e.g., 24 hours) to effectively ignore time limit
+		// unless user explicitly wants a safety timeout, but user said "only consider quantity".
+		duration = 24 * time.Hour
+	} else {
+		// Time mode: Use the provided time limit
+		if timeLimit <= 0 {
+			timeLimit = 1
+		}
+		duration = time.Duration(timeLimit * float64(time.Second))
+		if duration <= 0 {
+			duration = time.Second
+		}
 	}
-	duration := time.Duration(timeLimit * float64(time.Second))
-	if duration <= 0 {
-		duration = time.Second
-	}
+
 	ctx, cancel := stdcontext.WithTimeout(stdcontext.Background(), duration)
 	defer cancel()
 	runStart := time.Now()
 
+	workerLimit := -1
+	if txNum > 0 && len(tb.workers) > 0 {
+		workerLimit = txNum / len(tb.workers)
+		// Ensure at least 1 if txNum < workers but > 0 (though integer division handles 0)
+		if workerLimit == 0 && txNum > 0 {
+			workerLimit = 1 // Or handle remainder distribution, but simple division is fine for now
+		}
+	}
+
 	for i := 0; i < len(tb.workers); i++ {
 		tb.workers[i].resetForRun()
 		log.Default().Printf("worker %d started", i)
-		go tb.workers[i].cfxCal(ctx, int(NewConfig().Peers))
+		go tb.workers[i].cfxCal(ctx, int(NewConfig().Peers), workerLimit)
 	}
 
 	totalTransactions := 0
@@ -198,14 +223,15 @@ func (tb *TestBed) start(timeLimit float64) {
 			log.Default().Printf("全部工人已经执行完工作\n")
 			elapsedSeconds := time.Since(runStart).Seconds()
 			if elapsedSeconds <= 0 {
-				elapsedSeconds = duration.Seconds()
+				elapsedSeconds = 0.001
 			}
-			log.Default().Printf("执行时间%f(目标%f), 总计交易数量%d,不合法交易数量:%d,Tps:%f",
+
+			tps := float64(totalTransactions) / elapsedSeconds
+			log.Default().Printf("执行时间%f, 总计交易数量%d, 不合法交易数量:%d, Real TPS:%f",
 				elapsedSeconds,
-				duration.Seconds(),
 				totalTransactions,
 				invalidTransactions,
-				float64(totalTransactions)/elapsedSeconds,
+				tps,
 			)
 			return
 		}
@@ -357,9 +383,21 @@ func startHTTPServer(tb *TestBed) *http.Server {
 		if payload.Time != nil {
 			timeLimit = *payload.Time
 		}
-		if timeLimit <= 0 {
-			http.Error(w, "time must be greater than 0", http.StatusBadRequest)
-			return
+
+		txNum := -1
+		if payload.TxNum != nil {
+			txNum = *payload.TxNum
+		}
+
+		// Validation logic:
+		// If txNum > 0: Count mode. Time is ignored (or used as safety).
+		// If txNum <= 0 (or -1): Time mode. Time must be > 0.
+
+		if txNum <= 0 {
+			if timeLimit <= 0 {
+				http.Error(w, "time must be greater than 0 when tx_num is not set", http.StatusBadRequest)
+				return
+			}
 		}
 
 		tb.mu.Lock()
@@ -372,7 +410,7 @@ func startHTTPServer(tb *TestBed) *http.Server {
 		tb.running = true
 		tb.mu.Unlock()
 
-		log.Printf("start triggered via API with time=%f", timeLimit)
+		log.Printf("start triggered via API with time=%f, txNum=%d", timeLimit, txNum)
 
 		if err := file.Truncate(0); err != nil {
 			log.Printf("failed to truncate log file: %v", err)
@@ -380,16 +418,17 @@ func startHTTPServer(tb *TestBed) *http.Server {
 			log.Printf("failed to reset log file cursor: %v", err)
 		}
 
-		go func(limit float64) {
-			tb.start(limit)
+		go func(limit float64, num int) {
+			tb.start(limit, num)
 			tb.mu.Lock()
 			tb.running = false
 			tb.mu.Unlock()
-		}(timeLimit)
+		}(timeLimit, txNum)
 
 		response := map[string]interface{}{
 			"status": "started",
 			"time":   timeLimit,
+			"tx_num": txNum,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

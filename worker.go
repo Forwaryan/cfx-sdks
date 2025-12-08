@@ -40,6 +40,7 @@ type Worker struct {
 	tos        []cfxaddress.Address
 	bulkSender *bulk.BulkSender
 	pastTime   float64
+	lastTxHash *types.Hash
 }
 
 type BalanceInfo struct {
@@ -65,9 +66,9 @@ func (worker *Worker) accountPool() []types.Address {
 	}
 	return am.List()
 }
-func (worker *Worker) cfxCal(ctx context.Context, startPeer int) int {
+func (worker *Worker) cfxCal(ctx context.Context, startPeer int, limit int) int {
 	//worker.client.SetAccountManager(am)
-	res := worker.random_transfer(ctx, startPeer)
+	res := worker.random_transfer(ctx, startPeer, limit)
 	fmt.Println("id: " + worker.address + "     交易次数:  " + strconv.Itoa(res))
 	return res
 }
@@ -123,10 +124,12 @@ func (worker *Worker) transfer(cfx1 types.Address, cfx2 types.Address, value *he
 	overwriteTransactionNonce(&utx, nonce)
 	//utx.Nonce = nonce
 
-	_, err = worker.client.SendTransaction(utx)
+	txHash, err := worker.client.SendTransaction(utx)
 	if err != nil {
 		fmt.Println(err)
 		invalidTransactions++
+	} else {
+		worker.lastTxHash = &txHash
 	}
 	// _, err = worker.client.WaitForTransationReceipt(txhash, 5)
 	// if err != nil {
@@ -148,6 +151,7 @@ func (worker *Worker) nextNonceFor(addr types.Address) (*big.Int, error) {
 	return big.NewInt(next), nil
 }
 
+// 调用transfer2 是给各个账户分配余额 这里无需等待receipt
 func (worker *Worker) transfer2(cfx1 types.Address, cfx2 types.Address, value *hexutil.Big) {
 	nonce, err := worker.nextNonceFor(cfx1)
 	if err != nil {
@@ -217,13 +221,18 @@ func (worker *Worker) flushBatchTransactions(value *hexutil.Big) error {
 		return err
 	}
 
+	// Find the last successful transaction hash efficiently
+	lastSuccessIdx := -1
 	for i := 0; i < len(hashes); i++ {
 		if errors[i] != nil {
 			log.Default().Printf("sign and send the %vth tx error %v\n", i, errors[i])
+		} else {
+			lastSuccessIdx = i
 		}
-		// else {
-		// 	log.Default().Printf("the %vth tx hash %v\n", i, hashes[i])
-		// }
+	}
+
+	if lastSuccessIdx != -1 {
+		worker.lastTxHash = hashes[lastSuccessIdx]
 	}
 
 	worker.clearCache()
@@ -241,9 +250,42 @@ func (worker *Worker) flushPendingTransactions(value *hexutil.Big) {
 	}
 }
 
-func (worker *Worker) random_transfer(ctx context.Context, startPeer int) int {
-	//打乱账户顺序，交易金额为num
+func (worker *Worker) waitLastTx() {
+	if worker.lastTxHash == nil {
+		log.Default().Printf("[Worker %s] No last transaction to wait for", worker.address)
+		return
+	}
+	log.Default().Printf("[Worker %s] Waiting for last transaction receipt: %v", worker.address, *worker.lastTxHash)
 
+	startWait := time.Now()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Set a timeout for waiting (e.g., 120 seconds)
+	timeout := time.After(120 * time.Second)
+
+	for {
+		select {
+		case <-timeout:
+			log.Default().Printf("[Worker %s] Timeout waiting for last transaction receipt: %v. Waited: %v", worker.address, *worker.lastTxHash, time.Since(startWait))
+			return
+		case <-ticker.C:
+			receipt, err := worker.client.GetTransactionReceipt(*worker.lastTxHash)
+			if err != nil {
+				// Ignore transient errors, keep retrying
+				continue
+			}
+			if receipt != nil {
+				// Transaction included
+				log.Default().Printf("[Worker %s] Last transaction confirmed: %v, receipt: %v. Waited: %v", worker.address, *worker.lastTxHash, receipt, time.Since(startWait))
+				return
+			}
+		}
+	}
+}
+
+func (worker *Worker) random_transfer(ctx context.Context, startPeer int, limit int) int {
+	//打乱账户顺序，交易金额为num
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	lst := worker.accountPool()
 	if len(lst) == 0 {
@@ -283,9 +325,22 @@ func (worker *Worker) random_transfer(ctx context.Context, startPeer int) int {
 	}
 
 	for {
+		if limit > 0 && total >= limit {
+			worker.flushPendingTransactions(singleTransfer)
+			worker.waitLastTx()
+			*worker.sinal <- int(total)
+			return int(total)
+		}
+
 		select {
 		case <-ctx.Done():
+			// 时间因素结束时不会计算真实TPS
 			worker.flushPendingTransactions(singleTransfer)
+			// Only wait for last tx if we are in count mode (limit > 0),
+			// but here ctx is done, so we are likely in time mode or timeout.
+			// If we are in time mode (limit <= 0), we usually just stop.
+			// If we want to be precise about "Real TPS" even in time mode, we could wait,
+			// but the user said "if quantity is -1, only consider time".
 			*worker.sinal <- int(total)
 			log.Default().Printf("worker exited: %v", ctx.Err())
 			return int(total)
